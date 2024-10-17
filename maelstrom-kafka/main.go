@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 
@@ -61,12 +62,28 @@ type ListCommittedOffsetsResponse struct {
 	Offsets map[string]int `json:"offsets"`
 }
 
+func getCommitOffset(kv *maelstrom.KV, key string) int {
+	commOffset, err := kv.ReadInt(context.Background(), key + "-committed")
+	if err != nil {
+		kv.CompareAndSwap(context.Background(), key + "-committed", 0, 0, true)
+		commOffset = 0
+	}
+	return commOffset
+}
+
+func getPreviousOffset(kv *maelstrom.KV, key string) int {
+	prevOffset, err := kv.ReadInt(context.Background(), key + "-prev")
+	if err != nil {
+		kv.CompareAndSwap(context.Background(), key + "-prev", 0, 0, true)
+		prevOffset = 0
+	}
+	return prevOffset
+}
 
 func main() {
 	n := maelstrom.NewNode()
+	kv := maelstrom.NewLinKV(n)
 
-	committedOffsets := make(map[string]int)
-	prevOffsets := make(map[string]int)
 	logs := make(map[string][]LogEntry)
 
 	n.Handle("send", func(msg maelstrom.Message) error {
@@ -77,14 +94,8 @@ func main() {
 
 		// Determine the current offset for this key
 		var offset int
-		prevOffset, ok := prevOffsets[body.Key]
-		if !ok {
-			prevOffset = 0
-		}
-		commOffset, ok := committedOffsets[body.Key]
-		if !ok {
-			commOffset = 0
-		}
+		prevOffset := getPreviousOffset(kv, body.Key)
+		commOffset := getCommitOffset(kv, body.Key)
 		if commOffset > prevOffset {
 			panic("committed offset is greater than previous offset")
 		}
@@ -94,7 +105,7 @@ func main() {
 		logs[body.Key] = append(logs[body.Key], LogEntry{offset, body.Msg})
 
 		// Update the previous offset
-		prevOffsets[body.Key] = offset
+		kv.CompareAndSwap(context.Background(), body.Key + "-prev", prevOffset, offset, false)
 
 		// Return the offset of the message
 		return n.Reply(msg, SendResponse{MaelstromMessage{"send_ok"}, offset})
@@ -133,7 +144,18 @@ func main() {
 
 		// Update the offsets for each key
 		for key, offset := range body.Offsets {
-			committedOffsets[key] = offset
+			for true {
+				// Read the offset
+				currOffset := getCommitOffset(kv, key)
+				// If it's less than the current commit, ignore it
+				if offset > currOffset {
+					// Otherwise, CAS. If err, retry?
+					err := kv.CompareAndSwap(context.Background(), key + "-committed", currOffset, offset, true)
+					if err == nil {
+						break
+					}
+				}
+			}
 		}
 
 		return n.Reply(msg, CommitOffsetsResponse{MaelstromMessage{"commit_offsets_ok"}})
@@ -148,11 +170,11 @@ func main() {
 		// Return the current offsets for each key
 		retOff := make(map[string]int)
 		for _, key := range body.Keys {
-			offset, ok := committedOffsets[key]
-			if !ok {
+			commOffset, err := kv.ReadInt(context.Background(), key + "-committed")
+			if err != nil {
 				continue
 			}
-			retOff[key] = offset
+			retOff[key] = commOffset
 		}
 
 		return n.Reply(msg, ListCommittedOffsetsResponse{MaelstromMessage{"list_committed_offsets_ok"}, retOff})
