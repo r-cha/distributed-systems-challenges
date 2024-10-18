@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"maps"
+	"sort"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -92,6 +94,8 @@ func main() {
 			return err
 		}
 
+		keyLogs := logs[body.Key]
+
 		// Determine the current offset for this key
 		var offset int
 		prevOffset := getPreviousOffset(kv, body.Key)
@@ -102,10 +106,13 @@ func main() {
 		offset = prevOffset + 1
 
 		// Append the message to the log
-		logs[body.Key] = append(logs[body.Key], LogEntry{offset, body.Msg})
+		keyLogs = append(keyLogs, LogEntry{offset, body.Msg})
 
 		// Update the previous offset
 		kv.CompareAndSwap(context.Background(), body.Key + "-prev", prevOffset, offset, false)
+
+		// Write new logs
+		logs[body.Key] = keyLogs
 
 		// Return the offset of the message
 		return n.Reply(msg, SendResponse{MaelstromMessage{"send_ok"}, offset})
@@ -118,20 +125,38 @@ func main() {
 		}
 
 		msgs := make(map[string][]LogEntry)
-		// For each key
-		for key, offset := range body.Offsets {
-			// Get the log for this key
-			log, ok := logs[key]
-			if !ok {
-				log = []LogEntry{}
+
+		// Replicate the poll request to each neighbor
+		// NOTE: Concerning implications on overall load. This is a naive implementation.
+		neighborPolls := make(map[string]map[string][]LogEntry)
+		for _, node := range n.NodeIDs() {
+			if node == n.ID() || node == msg.Src {
+				continue
 			}
-			// And filter them based on the given offset
-			for _, entry := range log {
-				if entry.Offset >= offset {
-					msgs[key] = append(msgs[key], entry)
+			n.RPC(node, PollMessage{MaelstromMessage{"poll"}, body.Offsets}, func(resp maelstrom.Message) error {
+				var neighborResp PollResponse
+				if err := json.Unmarshal(resp.Body, &neighborResp); err != nil {
+					neighborPolls[node] = make(map[string][]LogEntry)
 				}
-			}
+				neighborPolls[node] = neighborResp.Msgs
+				return nil
+			})
 		}
+
+		// Merge the logs from all the neighbors
+		for _, neighborLogs := range neighborPolls {
+			maps.Copy(msgs, neighborLogs)
+		}
+
+		// They'll probably be staggered, so sort them by offset
+		for _, entries := range msgs {
+			sort.Slice(entries[:], func(i, j int) bool {
+				return entries[i].Offset < entries[j].Offset
+			})
+		}
+
+		// Also, update the local logs with the neighbors' entries
+		maps.Copy(logs, msgs)
 
 		return n.Reply(msg, PollResponse{MaelstromMessage{"poll_ok"}, msgs})
 	})
