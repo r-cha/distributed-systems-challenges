@@ -4,8 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"maps"
-	"sort"
+	"fmt"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -86,33 +85,32 @@ func main() {
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
 
-	logs := make(map[string][]LogEntry)
-
 	n.Handle("send", func(msg maelstrom.Message) error {
 		var body SendMessage
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
-		keyLogs := logs[body.Key]
-
 		// Determine the current offset for this key
 		var offset int
 		prevOffset := getPreviousOffset(kv, body.Key)
-		commOffset := getCommitOffset(kv, body.Key)
-		if commOffset > prevOffset {
-			panic("committed offset is greater than previous offset")
+		// commOffset := getCommitOffset(kv, body.Key)
+		// if commOffset > prevOffset {
+		// 	panic("committed offset is greater than previous offset")
+		// }
+		offset = prevOffset
+
+		// Claim the offset
+		for ; ; offset++ {
+			if err := kv.CompareAndSwap(context.Background(), body.Key + "-prev", prevOffset, offset, false); err == nil {
+				break
+			}
 		}
-		offset = prevOffset + 1
 
-		// Append the message to the log
-		keyLogs = append(keyLogs, LogEntry{offset, body.Msg})
-
-		// Update the previous offset
-		kv.CompareAndSwap(context.Background(), body.Key + "-prev", prevOffset, offset, false)
-
-		// Write new logs
-		logs[body.Key] = keyLogs
+		// Write new log
+		if err := kv.Write(context.Background(), fmt.Sprintf("%s-%d-%s", body.Key, offset, "entry"), body.Msg); err != nil {
+			return err
+		}
 
 		// Return the offset of the message
 		return n.Reply(msg, SendResponse{MaelstromMessage{"send_ok"}, offset})
@@ -125,38 +123,15 @@ func main() {
 		}
 
 		msgs := make(map[string][]LogEntry)
-
-		// Replicate the poll request to each neighbor
-		// NOTE: Concerning implications on overall load. This is a naive implementation.
-		neighborPolls := make(map[string]map[string][]LogEntry)
-		for _, node := range n.NodeIDs() {
-			if node == n.ID() || node == msg.Src {
-				continue
-			}
-			n.RPC(node, PollMessage{MaelstromMessage{"poll"}, body.Offsets}, func(resp maelstrom.Message) error {
-				var neighborResp PollResponse
-				if err := json.Unmarshal(resp.Body, &neighborResp); err != nil {
-					neighborPolls[node] = make(map[string][]LogEntry)
+		for key, offset := range body.Offsets {
+			for ; ; offset++ {
+				v, err := kv.ReadInt(context.Background(), fmt.Sprintf("%s-%d-%s", key, offset-1, "entry"))
+				if err != nil {
+					break
 				}
-				neighborPolls[node] = neighborResp.Msgs
-				return nil
-			})
+				msgs[key] = append(msgs[key], LogEntry{offset, v})
+			}
 		}
-
-		// Merge the logs from all the neighbors
-		for _, neighborLogs := range neighborPolls {
-			maps.Copy(msgs, neighborLogs)
-		}
-
-		// They'll probably be staggered, so sort them by offset
-		for _, entries := range msgs {
-			sort.Slice(entries[:], func(i, j int) bool {
-				return entries[i].Offset < entries[j].Offset
-			})
-		}
-
-		// Also, update the local logs with the neighbors' entries
-		maps.Copy(logs, msgs)
 
 		return n.Reply(msg, PollResponse{MaelstromMessage{"poll_ok"}, msgs})
 	})
