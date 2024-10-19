@@ -3,15 +3,20 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"fmt"
+	"log"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
 type LogEntry struct {
-	Offset int 
-	Msg    int 
+	Offset int
+	Msg    int
+}
+
+// To get our little struct encoded as an array
+func (le LogEntry) MarshalJSON() ([]byte, error) {
+	return json.Marshal([]int{le.Offset, le.Msg})
 }
 
 type MaelstromMessage struct {
@@ -22,11 +27,6 @@ type SendMessage struct {
 	MaelstromMessage
 	Key string `json:"key"`
 	Msg int    `json:"msg"`
-}
-
-// To get our little struct encoded as an array
-func (le LogEntry) MarshalJSON() ([]byte, error) {
-	return json.Marshal([]int{le.Offset, le.Msg})
 }
 
 type SendResponse struct {
@@ -63,24 +63,6 @@ type ListCommittedOffsetsResponse struct {
 	Offsets map[string]int `json:"offsets"`
 }
 
-func getCommitOffset(kv *maelstrom.KV, key string) int {
-	commOffset, err := kv.ReadInt(context.Background(), key + "-committed")
-	if err != nil {
-		kv.CompareAndSwap(context.Background(), key + "-committed", 0, 0, true)
-		commOffset = 0
-	}
-	return commOffset
-}
-
-func getPreviousOffset(kv *maelstrom.KV, key string) int {
-	prevOffset, err := kv.ReadInt(context.Background(), key + "-prev")
-	if err != nil {
-		kv.CompareAndSwap(context.Background(), key + "-prev", 0, 0, true)
-		prevOffset = 0
-	}
-	return prevOffset
-}
-
 func main() {
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
@@ -92,19 +74,26 @@ func main() {
 		}
 
 		// Determine the current offset for this key
-		var offset int
-		prevOffset := getPreviousOffset(kv, body.Key)
-		// commOffset := getCommitOffset(kv, body.Key)
-		// if commOffset > prevOffset {
-		// 	panic("committed offset is greater than previous offset")
-		// }
-		offset = prevOffset
-
-		// Claim the offset
-		for ; ; offset++ {
-			if err := kv.CompareAndSwap(context.Background(), body.Key + "-prev", prevOffset, offset, false); err == nil {
-				break
+		prevOffset, err := kv.ReadInt(context.Background(), body.Key+"-prev")
+		if err != nil {
+			if err.(*maelstrom.RPCError).Code == maelstrom.KeyDoesNotExist {
+				prevOffset = -1
+			} else {
+				return err
 			}
+		}
+
+		// Claim the offset, incrementing if necessary.
+		var offset int
+		for offset = prevOffset+1; ; offset++ {
+			if err := kv.CompareAndSwap(context.Background(), body.Key+"-prev", offset-1, offset, true); err != nil {
+				if err.(*maelstrom.RPCError).Code == maelstrom.PreconditionFailed {
+					continue
+				} else {
+					return err
+				}
+			}
+			break
 		}
 
 		// Write new log
@@ -123,11 +112,15 @@ func main() {
 		}
 
 		msgs := make(map[string][]LogEntry)
-		for key, offset := range body.Offsets {
-			for ; ; offset++ {
-				v, err := kv.ReadInt(context.Background(), fmt.Sprintf("%s-%d-%s", key, offset-1, "entry"))
+		for key, reqOffset := range body.Offsets {
+			// For each key, query values until there are no more.
+			for offset := reqOffset; ; offset++ {
+				v, err := kv.ReadInt(context.Background(), fmt.Sprintf("%s-%d-%s", key, offset, "entry"))
 				if err != nil {
-					break
+					if err.(*maelstrom.RPCError).Code == maelstrom.KeyDoesNotExist {
+						break
+					}
+					return err
 				}
 				msgs[key] = append(msgs[key], LogEntry{offset, v})
 			}
@@ -144,17 +137,8 @@ func main() {
 
 		// Update the offsets for each key
 		for key, offset := range body.Offsets {
-			for true {
-				// Read the offset
-				currOffset := getCommitOffset(kv, key)
-				// If it's less than the current commit, ignore it
-				if offset > currOffset {
-					// Otherwise, CAS. If err, retry?
-					err := kv.CompareAndSwap(context.Background(), key + "-committed", currOffset, offset, true)
-					if err == nil {
-						break
-					}
-				}
+			if err := kv.Write(context.Background(), key+"-committed", offset); err != nil {
+				return err
 			}
 		}
 
@@ -170,9 +154,13 @@ func main() {
 		// Return the current offsets for each key
 		retOff := make(map[string]int)
 		for _, key := range body.Keys {
-			commOffset, err := kv.ReadInt(context.Background(), key + "-committed")
+			commOffset, err := kv.ReadInt(context.Background(), key+"-committed")
 			if err != nil {
-				continue
+				if err.(*maelstrom.RPCError).Code == maelstrom.KeyDoesNotExist {
+					continue
+				} else {
+					return err
+				}
 			}
 			retOff[key] = commOffset
 		}
