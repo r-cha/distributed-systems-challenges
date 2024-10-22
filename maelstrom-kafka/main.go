@@ -88,6 +88,11 @@ func main() {
 		for offset = prevOffset+1; ; offset++ {
 			if err := kv.CompareAndSwap(context.Background(), body.Key+"-prev", offset-1, offset, true); err != nil {
 				if err.(*maelstrom.RPCError).Code == maelstrom.PreconditionFailed {
+					// NOTE: In practice, we see a 0% CAS failure in maelstrom tests.
+					// It's not hard to imagine a failure, though:
+					// two nodes can receive two writes for the same key at the same time,
+					// read the same previous offset, and each claim the next.
+					// We could likely demonstrate this with a low key cardinality and high node count.
 					continue
 				} else {
 					return err
